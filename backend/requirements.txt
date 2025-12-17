@@ -1,6 +1,5 @@
 fastapi
 uvicorn
 python-socketio
-requests
+pymongo
 python-dotenv
-PyGithub
