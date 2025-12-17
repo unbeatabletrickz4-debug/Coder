@@ -1,21 +1,22 @@
 import os
+import sys
+import subprocess
 import pty
 import select
-import subprocess
-import struct
-import fcntl
-import termios
 import signal
 import socketio
-from fastapi import FastAPI, HTTPException
+import threading
+import asyncio
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from github import Github
+from pymongo import MongoClient
 
 # --- CONFIG ---
-# Get these from Render Env Vars
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
-REPO_NAME = os.getenv("GITHUB_REPO") # Format: "your-username/your-repo"
+MONGO_URI = os.getenv("MONGO_URI") # Get this from MongoDB Atlas (Free)
+client = MongoClient(MONGO_URI)
+db = client["cloud_ide"]
+files_collection = db["files"]
 
 app = FastAPI()
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
@@ -28,82 +29,112 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- TERMINAL LOGIC (The "VS Code" part) ---
-# We use PTY (Pseudo-Terminal) to make it real and interactive
-sessions = {}
+# Global State for the running process
+current_process = None
+master_fd = None
 
-@sio.event
-async def connect(sid, environ):
-    # Spawn a new terminal process (bash)
-    master_fd, slave_fd = pty.openpty()
-    pid = subprocess.Popen(
-        ["bash"], 
-        stdin=slave_fd, 
-        stdout=slave_fd, 
-        stderr=slave_fd, 
-        preexec_fn=os.setsid,
-        shell=False,
-        close_fds=True
-    ).pid
-    
-    sessions[sid] = {"fd": master_fd, "pid": pid}
-    
-    # Read output from terminal and send to frontend
-    def read_output():
-        while True:
-            try:
-                if sid not in sessions: break
-                r, _, _ = select.select([master_fd], [], [], 0.1)
-                if master_fd in r:
-                    output = os.read(master_fd, 1024).decode(errors='ignore')
-                    if output:
-                        # Send to frontend Xterm.js
-                        import asyncio
-                        asyncio.run(sio.emit('terminal-output', output, room=sid))
-            except:
-                break
-    
-    import threading
-    threading.Thread(target=read_output, daemon=True).start()
+# --- API ENDPOINTS ---
 
-@sio.event
-async def disconnect(sid):
-    if sid in sessions:
-        os.close(sessions[sid]["fd"])
-        del sessions[sid]
-
-@sio.event
-async def terminal_input(sid, data):
-    if sid in sessions:
-        os.write(sessions[sid]["fd"], data.encode())
-
-# --- DEPLOY LOGIC (The "One-Click" part) ---
 class FileData(BaseModel):
     filename: str
     content: str
 
-@app.post("/save-and-deploy")
-def deploy_to_github(data: FileData):
-    if not GITHUB_TOKEN or not REPO_NAME:
-        raise HTTPException(500, "GitHub Token/Repo not configured on server.")
+@app.get("/files")
+def get_files():
+    # Load files from DB
+    files = {}
+    for doc in files_collection.find():
+        files[doc["filename"]] = doc["content"]
+    if not files:
+        # Default Template
+        return {"main.py": "import time\nprint('Hello Cloud!')\nwhile True:\n  time.sleep(1)"}
+    return files
 
+@app.post("/save")
+def save_file(data: FileData):
+    files_collection.update_one(
+        {"filename": data.filename}, 
+        {"$set": {"content": data.content}}, 
+        upsert=True
+    )
+    # Also save locally so python can run it
+    with open(data.filename, "w") as f:
+        f.write(data.content)
+    return {"status": "Saved"}
+
+@app.post("/install")
+def install_package(package: dict):
+    pkg_name = package.get("name")
     try:
-        # Save locally first (so you can run it in terminal)
-        with open(data.filename, "w") as f:
-            f.write(data.content)
-
-        # Push to GitHub
-        g = Github(GITHUB_TOKEN)
-        repo = g.get_repo(REPO_NAME)
-        
-        try:
-            # Update file if exists
-            contents = repo.get_contents(data.filename)
-            repo.update_file(contents.path, "Update via Cloud IDE", data.content, contents.sha)
-        except:
-            # Create file if new
-            repo.create_file(data.filename, "Create via Cloud IDE", data.content)
-            
-        return {"status": "success", "message": "Code pushed to GitHub! Render will deploy now."}
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name])
+        return {"status": f"Installed {pkg_name}"}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        return {"status": f"Error: {str(e)}"}
+
+# --- TERMINAL & RUNNER LOGIC ---
+
+@sio.event
+async def run_code(sid, filename):
+    global current_process, master_fd
+    
+    # 1. Kill existing process
+    if current_process:
+        try:
+            os.kill(current_process.pid, signal.SIGTERM)
+        except:
+            pass
+    
+    # 2. Start new process with PTY (Pseudo Terminal)
+    # This allows interactive input() to work!
+    master_fd, slave_fd = pty.openpty()
+    
+    current_process = subprocess.Popen(
+        [sys.executable, "-u", filename], # -u for unbuffered output
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        preexec_fn=os.setsid,
+        close_fds=True
+    )
+    
+    os.close(slave_fd) # Close slave in parent
+    
+    await sio.emit('status', 'Running...', room=sid)
+
+    # 3. Stream output loop
+    def read_output():
+        global master_fd
+        while True:
+            try:
+                r, _, _ = select.select([master_fd], [], [], 0.1)
+                if master_fd in r:
+                    data = os.read(master_fd, 1024).decode(errors='ignore')
+                    if data:
+                        asyncio.run(sio.emit('term-data', data))
+                    else:
+                        break
+            except (OSError, ValueError):
+                break
+    
+    threading.Thread(target=read_output, daemon=True).start()
+
+@sio.event
+async def stop_code(sid):
+    global current_process
+    if current_process:
+        try:
+            os.kill(current_process.pid, signal.SIGTERM)
+            current_process = None
+            await sio.emit('term-data', '\n\u001b[31m[Process Stopped by User]\u001b[0m\n')
+            await sio.emit('status', 'Stopped')
+        except:
+            pass
+
+@sio.event
+async def term_input(sid, data):
+    global master_fd
+    if master_fd:
+        try:
+            os.write(master_fd, data.encode())
+        except:
+            pass
