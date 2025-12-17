@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-pydantic
-pyTelegramBotAPI
-python-dotenv
+python-socketio
 requests
+python-dotenv
+PyGithub
