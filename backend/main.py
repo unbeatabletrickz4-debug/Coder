@@ -1,38 +1,109 @@
 import os
-import threading
-import telebot
+import pty
+import select
+import subprocess
+import struct
+import fcntl
+import termios
+import signal
+import socketio
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from github import Github
 
-# ... keep your existing imports and FastAPI setup ...
+# --- CONFIG ---
+# Get these from Render Env Vars
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
+REPO_NAME = os.getenv("GITHUB_REPO") # Format: "your-username/your-repo"
 
-# 👇 CHANGED: Read token from Environment Variable
-MAIN_BOT_TOKEN = os.getenv("HOST_BOT_TOKEN") 
+app = FastAPI()
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
+socket_app = socketio.ASGIApp(sio, app)
 
-def run_main_bot():
-    # If token is missing, don't crash, just skip starting the bot
-    if not MAIN_BOT_TOKEN:
-        print("⚠️ No HOST_BOT_TOKEN found in Env Vars. Main bot will not run.")
-        return
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    bot = telebot.TeleBot(MAIN_BOT_TOKEN)
+# --- TERMINAL LOGIC (The "VS Code" part) ---
+# We use PTY (Pseudo-Terminal) to make it real and interactive
+sessions = {}
 
-    @bot.message_handler(commands=['start'])
-    def send_welcome(message):
-        # Create the button that opens your Mini App
-        markup = telebot.types.InlineKeyboardMarkup()
-        
-        # 👇 Update this with your actual Frontend URL
-        web_app_url = "https://my-python-editor.onrender.com" 
-        
-        web_app = telebot.types.WebAppInfo(web_app_url)
-        markup.add(telebot.types.InlineKeyboardButton("🚀 Open Cloud Editor", web_app=web_app))
-        
-        bot.reply_to(message, "Welcome to Python Cloud Host! 🐍\nClick below to start coding.", reply_markup=markup)
+@sio.event
+async def connect(sid, environ):
+    # Spawn a new terminal process (bash)
+    master_fd, slave_fd = pty.openpty()
+    pid = subprocess.Popen(
+        ["bash"], 
+        stdin=slave_fd, 
+        stdout=slave_fd, 
+        stderr=slave_fd, 
+        preexec_fn=os.setsid,
+        shell=False,
+        close_fds=True
+    ).pid
+    
+    sessions[sid] = {"fd": master_fd, "pid": pid}
+    
+    # Read output from terminal and send to frontend
+    def read_output():
+        while True:
+            try:
+                if sid not in sessions: break
+                r, _, _ = select.select([master_fd], [], [], 0.1)
+                if master_fd in r:
+                    output = os.read(master_fd, 1024).decode(errors='ignore')
+                    if output:
+                        # Send to frontend Xterm.js
+                        import asyncio
+                        asyncio.run(sio.emit('terminal-output', output, room=sid))
+            except:
+                break
+    
+    import threading
+    threading.Thread(target=read_output, daemon=True).start()
+
+@sio.event
+async def disconnect(sid):
+    if sid in sessions:
+        os.close(sessions[sid]["fd"])
+        del sessions[sid]
+
+@sio.event
+async def terminal_input(sid, data):
+    if sid in sessions:
+        os.write(sessions[sid]["fd"], data.encode())
+
+# --- DEPLOY LOGIC (The "One-Click" part) ---
+class FileData(BaseModel):
+    filename: str
+    content: str
+
+@app.post("/save-and-deploy")
+def deploy_to_github(data: FileData):
+    if not GITHUB_TOKEN or not REPO_NAME:
+        raise HTTPException(500, "GitHub Token/Repo not configured on server.")
 
     try:
-        print("✅ Main Host Bot Started...")
-        bot.infinity_polling()
-    except Exception as e:
-        print(f"❌ Main Bot Error: {e}")
+        # Save locally first (so you can run it in terminal)
+        with open(data.filename, "w") as f:
+            f.write(data.content)
 
-# Start the bot in background
-threading.Thread(target=run_main_bot, daemon=True).start()
+        # Push to GitHub
+        g = Github(GITHUB_TOKEN)
+        repo = g.get_repo(REPO_NAME)
+        
+        try:
+            # Update file if exists
+            contents = repo.get_contents(data.filename)
+            repo.update_file(contents.path, "Update via Cloud IDE", data.content, contents.sha)
+        except:
+            # Create file if new
+            repo.create_file(data.filename, "Create via Cloud IDE", data.content)
+            
+        return {"status": "success", "message": "Code pushed to GitHub! Render will deploy now."}
+    except Exception as e:
+        raise HTTPException(500, str(e))
