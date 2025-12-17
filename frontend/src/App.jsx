@@ -1,83 +1,112 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Editor from '@monaco-editor/react';
+import { Terminal } from 'xterm';
+import { FitAddon } from 'xterm-addon-fit';
+import io from 'socket.io-client';
 import axios from 'axios';
-import { Play, Save, Settings, Terminal } from 'lucide-react';
+import { Play, CloudUpload, Terminal as TermIcon, FileCode } from 'lucide-react';
+import 'xterm/css/xterm.css';
 
-// REPLACE THIS with your actual Backend URL after you deploy the backend part
-const BACKEND_URL = "https://coder-dvli.onrender.com"; 
+// REPLACE WITH YOUR BACKEND URL
+const BACKEND_URL = "https://your-backend-service.onrender.com"; 
 
 function App() {
-  const [code, setCode] = useState(`import telebot\nimport os\n\nTOKEN = os.getenv("BOT_TOKEN")\nbot = telebot.TeleBot(TOKEN)\n\n@bot.message_handler(commands=['start'])\ndef send_welcome(message):\n    bot.reply_to(message, "Hello World!")\n\nbot.infinity_polling()`);
-  const [envVars, setEnvVars] = useState([{ key: 'BOT_TOKEN', value: '' }]);
-  const [logs, setLogs] = useState("Ready to deploy...");
-  const [view, setView] = useState('editor'); // 'editor' or 'settings'
+  const [code, setCode] = useState(`print("Hello World")\nname = input("What is your name? ")\nprint(f"Nice to meet you, {name}")`);
+  const [status, setStatus] = useState("Ready");
+  const terminalRef = useRef(null);
+  const socketRef = useRef(null);
+  const xtermRef = useRef(null);
+
+  useEffect(() => {
+    // 1. Setup Socket.IO
+    socketRef.current = io(BACKEND_URL);
+
+    // 2. Setup Xterm.js
+    const term = new Terminal({
+      theme: { background: '#000000' },
+      cursorBlink: true,
+      fontSize: 14,
+      fontFamily: 'Menlo, monospace'
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(terminalRef.current);
+    fitAddon.fit();
+    xtermRef.current = term;
+
+    // 3. Connect IO
+    term.onData(data => socketRef.current.emit('terminal-input', data));
+    socketRef.current.on('terminal-output', data => term.write(data));
+
+    return () => {
+      socketRef.current.disconnect();
+      term.dispose();
+    };
+  }, []);
+
+  const runLocally = () => {
+    // This sends a command to the terminal to write the file and run it
+    const escapedCode = code.replace(/"/g, '\\"');
+    // Command: echo "code" > main.py && python3 main.py
+    socketRef.current.emit('terminal-input', `cat <<EOF > main.py\n${code}\nEOF\n`);
+    setTimeout(() => {
+      socketRef.current.emit('terminal-input', `python3 main.py\r`);
+    }, 500);
+  };
 
   const deploy = async () => {
-    setLogs("Deploying...");
+    setStatus("Deploying to GitHub...");
     try {
-      const formattedEnvs = envVars.reduce((acc, curr) => {
-        if(curr.key) acc[curr.key] = curr.value;
-        return acc;
-      }, {});
-
-      // Random User ID for demo (In real app, get from Telegram WebApp)
-      const userId = "user_" + Math.floor(Math.random() * 1000);
-
-      await axios.post(`${BACKEND_URL}/deploy`, {
-        userId: userId,
-        code: code,
-        envVars: formattedEnvs
+      await axios.post(`${BACKEND_URL}/save-and-deploy`, {
+        filename: "main.py",
+        content: code
       });
-      setLogs("✅ Success! Bot is running.");
+      setStatus("✅ Pushed to GitHub! Render is building...");
     } catch (err) {
-      setLogs("❌ Error: " + err.message);
+      setStatus("❌ Error: " + err.message);
     }
   };
 
   return (
-    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', color: 'white', fontFamily: 'monospace' }}>
-      
+    <div className="h-screen flex flex-col bg-[#1e1e1e] text-white">
       {/* Header */}
-      <div style={{ padding: '10px', background: '#2d2d2d', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span style={{ fontWeight: 'bold' }}>🐍 PyDeploy</span>
-        <button onClick={deploy} style={{ background: '#2ea043', color: 'white', border: 'none', padding: '5px 15px', borderRadius: '4px', cursor: 'pointer', display: 'flex', gap: '5px', alignItems: 'center' }}>
-          <Play size={16}/> Run
-        </button>
+      <div className="flex justify-between items-center p-3 bg-[#2d2d2d] border-b border-gray-700">
+        <div className="flex items-center gap-2 font-bold text-blue-400">
+          <FileCode size={20}/> Python IDE
+        </div>
+        <div className="flex gap-3">
+          <button onClick={runLocally} className="flex items-center gap-2 bg-green-700 hover:bg-green-600 px-3 py-1 rounded text-sm transition">
+            <Play size={14}/> Test in Terminal
+          </button>
+          <button onClick={deploy} className="flex items-center gap-2 bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded text-sm transition">
+            <CloudUpload size={14}/> Deploy to Render
+          </button>
+        </div>
       </div>
 
-      {/* Tabs */}
-      <div style={{ background: '#252526', display: 'flex' }}>
-        <button onClick={()=>setView('editor')} style={{ padding: '10px', background: view==='editor'?'#1e1e1e':'transparent', color: view==='editor'?'white':'#888', border: 'none', cursor: 'pointer' }}>main.py</button>
-        <button onClick={()=>setView('settings')} style={{ padding: '10px', background: view==='settings'?'#1e1e1e':'transparent', color: view==='settings'?'white':'#888', border: 'none', cursor: 'pointer', display: 'flex', gap: '5px' }}><Settings size={14}/> Env Vars</button>
+      {/* Editor (60%) */}
+      <div className="flex-grow">
+        <Editor 
+          height="100%" 
+          defaultLanguage="python" 
+          theme="vs-dark" 
+          value={code} 
+          onChange={setCode}
+          options={{ minimap: { enabled: false }, fontSize: 14 }}
+        />
       </div>
 
-      {/* Main Area */}
-      <div style={{ flex: 1, position: 'relative' }}>
-        {view === 'editor' ? (
-          <Editor 
-            height="100%" 
-            defaultLanguage="python" 
-            theme="vs-dark" 
-            value={code} 
-            onChange={(val)=>setCode(val)} 
-          />
-        ) : (
-          <div style={{ padding: '20px' }}>
-            <h3>Environment Variables</h3>
-            {envVars.map((env, i) => (
-              <div key={i} style={{ display: 'flex', gap: '10px', marginBottom: '10px' }}>
-                <input placeholder="KEY" value={env.key} onChange={e=>{const n=[...envVars];n[i].key=e.target.value;setEnvVars(n)}} style={{ background: '#3c3c3c', border: 'none', color: 'white', padding: '8px' }} />
-                <input placeholder="VALUE" value={env.value} onChange={e=>{const n=[...envVars];n[i].value=e.target.value;setEnvVars(n)}} style={{ background: '#3c3c3c', border: 'none', color: 'white', padding: '8px', flex: 1 }} />
-              </div>
-            ))}
-            <button onClick={()=>setEnvVars([...envVars, {key:'', value:''}])} style={{ background: 'transparent', border: '1px solid #444', color: '#888', padding: '5px', cursor: 'pointer' }}>+ Add Var</button>
-          </div>
-        )}
+      {/* Terminal (40%) */}
+      <div className="h-[40%] bg-black border-t border-gray-700 flex flex-col">
+        <div className="px-3 py-1 bg-[#252526] text-xs text-gray-400 flex items-center gap-2">
+          <TermIcon size={12}/> TERMINAL
+        </div>
+        <div ref={terminalRef} className="flex-grow p-1 overflow-hidden" />
       </div>
 
-      {/* Logs Footer */}
-      <div style={{ padding: '5px 10px', background: '#007acc', fontSize: '12px' }}>
-        {logs}
+      {/* Footer */}
+      <div className="bg-[#007acc] text-xs px-2 py-1">
+        {status}
       </div>
     </div>
   );
