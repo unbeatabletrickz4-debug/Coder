@@ -1,68 +1,38 @@
 import os
-import sys
-import subprocess
-from typing import Dict
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import threading
+import telebot
 
-app = FastAPI()
+# ... keep your existing imports and FastAPI setup ...
 
-# Allow connections from your frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 👇 CHANGED: Read token from Environment Variable
+MAIN_BOT_TOKEN = os.getenv("HOST_BOT_TOKEN") 
 
-# Store running processes: { "user_id": subprocess_object }
-running_bots: Dict[str, subprocess.Popen] = {}
+def run_main_bot():
+    # If token is missing, don't crash, just skip starting the bot
+    if not MAIN_BOT_TOKEN:
+        print("⚠️ No HOST_BOT_TOKEN found in Env Vars. Main bot will not run.")
+        return
 
-class DeployRequest(BaseModel):
-    userId: str
-    code: str
-    envVars: Dict[str, str]
+    bot = telebot.TeleBot(MAIN_BOT_TOKEN)
 
-# Create folder for user scripts
-if not os.path.exists("user_bots"):
-    os.makedirs("user_bots")
+    @bot.message_handler(commands=['start'])
+    def send_welcome(message):
+        # Create the button that opens your Mini App
+        markup = telebot.types.InlineKeyboardMarkup()
+        
+        # 👇 Update this with your actual Frontend URL
+        web_app_url = "https://my-python-editor.onrender.com" 
+        
+        web_app = telebot.types.WebAppInfo(web_app_url)
+        markup.add(telebot.types.InlineKeyboardButton("🚀 Open Cloud Editor", web_app=web_app))
+        
+        bot.reply_to(message, "Welcome to Python Cloud Host! 🐍\nClick below to start coding.", reply_markup=markup)
 
-@app.get("/")
-def read_root():
-    return {"status": "Python Host Active"}
-
-@app.post("/deploy")
-def deploy_bot(data: DeployRequest):
-    user_id = data.userId
-    
-    # 1. Stop existing bot for this user if running
-    if user_id in running_bots:
-        try:
-            running_bots[user_id].terminate()
-            running_bots[user_id].wait()
-        except:
-            pass
-
-    # 2. Save Code to File
-    filename = f"user_bots/{user_id}.py"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(data.code)
-
-    # 3. Prepare Environment Variables
-    env = os.environ.copy()
-    env.update(data.envVars)
-    env["PYTHONUNBUFFERED"] = "1" # Important for logs
-
-    # 4. Run the script using the same Python interpreter
     try:
-        proc = subprocess.Popen(
-            [sys.executable, filename],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        running_bots[user_id] = proc
-        return {"success": True, "message": "Bot Deployed Successfully"}
+        print("✅ Main Host Bot Started...")
+        bot.infinity_polling()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Main Bot Error: {e}")
+
+# Start the bot in background
+threading.Thread(target=run_main_bot, daemon=True).start()
