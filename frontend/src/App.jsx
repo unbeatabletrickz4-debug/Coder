@@ -4,7 +4,8 @@ import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import io from 'socket.io-client';
 import axios from 'axios';
-import { Play, CloudUpload, Terminal as TermIcon, FileCode } from 'lucide-react';
+// 👇 FIXED: Changed CloudUpload to UploadCloud
+import { Play, UploadCloud, Terminal as TermIcon, FileCode } from 'lucide-react';
 import 'xterm/css/xterm.css';
 
 // REPLACE WITH YOUR BACKEND URL
@@ -79,7 +80,8 @@ function App() {
             <Play size={14}/> Test in Terminal
           </button>
           <button onClick={deploy} className="flex items-center gap-2 bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded text-sm transition">
-            <CloudUpload size={14}/> Deploy to Render
+            {/* 👇 FIXED: Using UploadCloud here */}
+            <UploadCloud size={14}/> Deploy to Render
           </button>
         </div>
       </div>
