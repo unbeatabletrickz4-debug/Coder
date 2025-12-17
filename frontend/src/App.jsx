@@ -8,7 +8,7 @@ import { Play, CloudUpload, Terminal as TermIcon, FileCode } from 'lucide-react'
 import 'xterm/css/xterm.css';
 
 // REPLACE WITH YOUR BACKEND URL
-const BACKEND_URL = "https://your-backend-service.onrender.com"; 
+const BACKEND_URL = "https://coder-dvli.onrender.com"; 
 
 function App() {
   const [code, setCode] = useState(`print("Hello World")\nname = input("What is your name? ")\nprint(f"Nice to meet you, {name}")`);
