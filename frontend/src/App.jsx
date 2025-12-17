@@ -4,7 +4,7 @@ import axios from 'axios';
 import { Play, Save, Settings, Terminal } from 'lucide-react';
 
 // REPLACE THIS with your actual Backend URL after you deploy the backend part
-const BACKEND_URL = "https://YOUR-BACKEND-SERVICE-NAME.onrender.com"; 
+const BACKEND_URL = "https://coder-dvli.onrender.com"; 
 
 function App() {
   const [code, setCode] = useState(`import telebot\nimport os\n\nTOKEN = os.getenv("BOT_TOKEN")\nbot = telebot.TeleBot(TOKEN)\n\n@bot.message_handler(commands=['start'])\ndef send_welcome(message):\n    bot.reply_to(message, "Hello World!")\n\nbot.infinity_polling()`);
