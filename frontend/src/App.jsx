@@ -4,30 +4,39 @@ import { Terminal } from 'xterm';
 import { FitAddon } from 'xterm-addon-fit';
 import io from 'socket.io-client';
 import axios from 'axios';
-// 👇 FIXED: Changed CloudUpload to UploadCloud
-import { Play, UploadCloud, Terminal as TermIcon, FileCode } from 'lucide-react';
+import { 
+  Play, Square, Save, Box, 
+  Terminal as TermIcon, FileCode, Check 
+} from 'lucide-react';
 import 'xterm/css/xterm.css';
 
-// REPLACE WITH YOUR BACKEND URL
+// 🛑 REPLACE WITH YOUR RENDER BACKEND URL
 const BACKEND_URL = "https://coder-dvli.onrender.com"; 
 
 function App() {
-  const [code, setCode] = useState(`print("Hello World")\nname = input("What is your name? ")\nprint(f"Nice to meet you, {name}")`);
-  const [status, setStatus] = useState("Ready");
+  const [socket, setSocket] = useState(null);
+  const [code, setCode] = useState("");
+  const [status, setStatus] = useState("Idle");
+  const [pkgName, setPkgName] = useState("");
+  
   const terminalRef = useRef(null);
-  const socketRef = useRef(null);
   const xtermRef = useRef(null);
 
+  // Load code on start
   useEffect(() => {
-    // 1. Setup Socket.IO
-    socketRef.current = io(BACKEND_URL);
+    axios.get(`${BACKEND_URL}/files`).then(res => {
+      if(res.data['main.py']) setCode(res.data['main.py']);
+    });
 
-    // 2. Setup Xterm.js
+    const newSocket = io(BACKEND_URL);
+    setSocket(newSocket);
+
+    // Setup Terminal
     const term = new Terminal({
-      theme: { background: '#000000' },
-      cursorBlink: true,
-      fontSize: 14,
-      fontFamily: 'Menlo, monospace'
+      theme: { background: '#0f0f0f', foreground: '#00ff00' },
+      fontFamily: 'Menlo, monospace',
+      fontSize: 13,
+      cursorBlink: true
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -35,80 +44,118 @@ function App() {
     fitAddon.fit();
     xtermRef.current = term;
 
-    // 3. Connect IO
-    term.onData(data => socketRef.current.emit('terminal-input', data));
-    socketRef.current.on('terminal-output', data => term.write(data));
+    term.write('\x1b[33mWelcome to Python Cloud OS v2.0\x1b[0m\r\n');
 
-    return () => {
-      socketRef.current.disconnect();
-      term.dispose();
-    };
+    // Socket Events
+    newSocket.on('term-data', (data) => term.write(data));
+    newSocket.on('status', (val) => setStatus(val));
+    
+    // Send Input
+    term.onData(data => newSocket.emit('term_input', data));
+
+    return () => newSocket.disconnect();
   }, []);
 
-  const runLocally = () => {
-    // This sends a command to the terminal to write the file and run it
-    const escapedCode = code.replace(/"/g, '\\"');
-    // Command: echo "code" > main.py && python3 main.py
-    socketRef.current.emit('terminal-input', `cat <<EOF > main.py\n${code}\nEOF\n`);
-    setTimeout(() => {
-      socketRef.current.emit('terminal-input', `python3 main.py\r`);
-    }, 500);
+  const saveCode = async () => {
+    await axios.post(`${BACKEND_URL}/save`, { filename: 'main.py', content: code });
+    xtermRef.current.write('\r\n\x1b[32m[System] File Saved Successfully.\x1b[0m\r\n');
   };
 
-  const deploy = async () => {
-    setStatus("Deploying to GitHub...");
-    try {
-      await axios.post(`${BACKEND_URL}/save-and-deploy`, {
-        filename: "main.py",
-        content: code
-      });
-      setStatus("✅ Pushed to GitHub! Render is building...");
-    } catch (err) {
-      setStatus("❌ Error: " + err.message);
-    }
+  const runCode = async () => {
+    await saveCode();
+    socket.emit('run_code', 'main.py');
+  };
+
+  const stopCode = () => {
+    socket.emit('stop_code');
+  };
+
+  const installPkg = async () => {
+    xtermRef.current.write(`\r\n[Pip] Installing ${pkgName}...\r\n`);
+    const res = await axios.post(`${BACKEND_URL}/install`, { name: pkgName });
+    xtermRef.current.write(`[Pip] ${res.data.status}\r\n`);
+    setPkgName("");
   };
 
   return (
-    <div className="h-screen flex flex-col bg-[#1e1e1e] text-white">
-      {/* Header */}
-      <div className="flex justify-between items-center p-3 bg-[#2d2d2d] border-b border-gray-700">
-        <div className="flex items-center gap-2 font-bold text-blue-400">
-          <FileCode size={20}/> Python IDE
+    <div className="h-screen flex flex-col bg-[#111] text-white font-mono">
+      
+      {/* --- TOP BAR --- */}
+      <div className="h-12 bg-[#1a1a1a] border-b border-[#333] flex items-center justify-between px-4">
+        <div className="flex items-center gap-2 text-cyan-400 font-bold">
+          <FileCode size={18}/> CLOUD.PY
         </div>
-        <div className="flex gap-3">
-          <button onClick={runLocally} className="flex items-center gap-2 bg-green-700 hover:bg-green-600 px-3 py-1 rounded text-sm transition">
-            <Play size={14}/> Test in Terminal
+        
+        {/* Run Controls */}
+        <div className="flex items-center gap-2 bg-[#222] p-1 rounded-lg border border-[#333]">
+          <button onClick={saveCode} className="p-2 hover:bg-[#333] rounded" title="Save">
+            <Save size={16} className="text-gray-400"/>
           </button>
-          <button onClick={deploy} className="flex items-center gap-2 bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded text-sm transition">
-            {/* 👇 FIXED: Using UploadCloud here */}
-            <UploadCloud size={14}/> Deploy to Render
+          <div className="w-px h-4 bg-[#444]"></div>
+          <button onClick={runCode} className="flex items-center gap-2 px-3 py-1 bg-green-900/50 hover:bg-green-800 text-green-400 text-xs rounded transition">
+            <Play size={14}/> EXECUTE
+          </button>
+          <button onClick={stopCode} className="flex items-center gap-2 px-3 py-1 bg-red-900/50 hover:bg-red-800 text-red-400 text-xs rounded transition">
+            <Square size={14}/> STOP
           </button>
         </div>
-      </div>
 
-      {/* Editor (60%) */}
-      <div className="flex-grow">
-        <Editor 
-          height="100%" 
-          defaultLanguage="python" 
-          theme="vs-dark" 
-          value={code} 
-          onChange={setCode}
-          options={{ minimap: { enabled: false }, fontSize: 14 }}
-        />
-      </div>
-
-      {/* Terminal (40%) */}
-      <div className="h-[40%] bg-black border-t border-gray-700 flex flex-col">
-        <div className="px-3 py-1 bg-[#252526] text-xs text-gray-400 flex items-center gap-2">
-          <TermIcon size={12}/> TERMINAL
+        {/* Status Indicator */}
+        <div className="flex items-center gap-2 text-xs">
+          <div className={`w-2 h-2 rounded-full ${status === 'Running...' ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`}></div>
+          <span className="text-gray-400 uppercase">{status}</span>
         </div>
-        <div ref={terminalRef} className="flex-grow p-1 overflow-hidden" />
       </div>
 
-      {/* Footer */}
-      <div className="bg-[#007acc] text-xs px-2 py-1">
-        {status}
+      {/* --- MIDDLE: EDITOR & TOOLS --- */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Editor */}
+        <div className="flex-1 relative">
+          <Editor 
+            height="100%" 
+            defaultLanguage="python" 
+            theme="vs-dark" 
+            value={code} 
+            onChange={setCode}
+            options={{
+              minimap: { enabled: false },
+              fontSize: 14,
+              fontFamily: '"JetBrains Mono", monospace'
+            }}
+          />
+        </div>
+
+        {/* Sidebar Tools (Package Manager) */}
+        <div className="w-64 bg-[#181818] border-l border-[#333] p-4 flex flex-col gap-4">
+          <div className="text-xs text-gray-500 font-bold tracking-wider mb-2">PACKAGE MANAGER</div>
+          <div className="bg-[#222] p-3 rounded border border-[#333]">
+            <div className="text-xs text-gray-400 mb-2 flex items-center gap-2">
+              <Box size={12}/> Install Library
+            </div>
+            <div className="flex gap-2">
+              <input 
+                className="w-full bg-[#111] border border-[#444] text-xs p-2 rounded text-white focus:outline-none focus:border-cyan-500"
+                placeholder="e.g. telebot"
+                value={pkgName}
+                onChange={e => setPkgName(e.target.value)}
+              />
+              <button onClick={installPkg} className="bg-cyan-700 hover:bg-cyan-600 p-2 rounded text-white">
+                <Check size={14}/>
+              </button>
+            </div>
+            <div className="text-[10px] text-gray-600 mt-2">
+              Installs pip packages directly to the host server.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* --- BOTTOM: TERMINAL --- */}
+      <div className="h-[35%] bg-black border-t border-[#333] flex flex-col">
+        <div className="px-4 py-1 bg-[#1a1a1a] text-[10px] text-gray-500 flex items-center gap-2 uppercase tracking-widest border-b border-[#333]">
+          <TermIcon size={12}/> Interactive Console
+        </div>
+        <div className="flex-1 p-2 overflow-hidden" ref={terminalRef}></div>
       </div>
     </div>
   );
