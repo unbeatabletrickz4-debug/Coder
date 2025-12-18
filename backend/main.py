@@ -7,21 +7,38 @@ import signal
 import socketio
 import threading
 import asyncio
+import fcntl
+import struct
+import termios
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pymongo import MongoClient
 
-# --- CONFIG ---
-MONGO_URI = os.getenv("MONGO_URI") # Get this from MongoDB Atlas (Free)
-client = MongoClient(MONGO_URI)
-db = client["cloud_ide"]
-files_collection = db["files"]
+# --- DATABASE CONNECTION ---
+# 1. Get this from Render Environment Variables
+# If no DB is provided, we use a temporary in-memory dict (Code is lost on restart)
+MONGO_URI = os.getenv("MONGO_URI")
+
+if MONGO_URI:
+    try:
+        client = MongoClient(MONGO_URI)
+        db = client["cloud_ide"]
+        files_collection = db["files"]
+        print("✅ Connected to MongoDB")
+    except Exception as e:
+        print(f"❌ MongoDB Error: {e}")
+        files_collection = None
+else:
+    print("⚠️ No MONGO_URI found. Using temporary memory.")
+    files_collection = None
+
+# In-memory fallback
+memory_store = {"main.py": "print('Hello from Mobile IDE!')"}
 
 app = FastAPI()
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
-socket_app = socketio.ASGIApp(sio, app)
 
+# Allow connection from your Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,112 +46,133 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global State for the running process
-current_process = None
-master_fd = None
+# SocketIO for Real-Time Terminal
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
+socket_app = socketio.ASGIApp(sio, app)
+
+# Global process state
+sessions = {} # { sid: { fd, pid } }
 
 # --- API ENDPOINTS ---
 
-class FileData(BaseModel):
-    filename: str
-    content: str
+@app.get("/")
+def health():
+    return {"status": "Mobile Backend Active 🚀"}
 
 @app.get("/files")
 def get_files():
-    # Load files from DB
-    files = {}
-    for doc in files_collection.find():
-        files[doc["filename"]] = doc["content"]
-    if not files:
-        # Default Template
-        return {"main.py": "import time\nprint('Hello Cloud!')\nwhile True:\n  time.sleep(1)"}
-    return files
+    if files_collection:
+        data = files_collection.find_one({"filename": "main.py"})
+        content = data["content"] if data else ""
+    else:
+        content = memory_store.get("main.py", "")
+    
+    return {"main.py": content}
+
+class SaveRequest(BaseModel):
+    filename: str
+    content: str
 
 @app.post("/save")
-def save_file(data: FileData):
-    files_collection.update_one(
-        {"filename": data.filename}, 
-        {"$set": {"content": data.content}}, 
-        upsert=True
-    )
-    # Also save locally so python can run it
-    with open(data.filename, "w") as f:
+def save_file(data: SaveRequest):
+    # 1. Save to DB (Persistence)
+    if files_collection:
+        files_collection.update_one(
+            {"filename": data.filename},
+            {"$set": {"content": data.content}},
+            upsert=True
+        )
+    else:
+        memory_store[data.filename] = data.content
+    
+    # 2. Save to Disk (So Python can run it)
+    with open(data.filename, "w", encoding="utf-8") as f:
         f.write(data.content)
+        
     return {"status": "Saved"}
 
-@app.post("/install")
-def install_package(package: dict):
-    pkg_name = package.get("name")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name])
-        return {"status": f"Installed {pkg_name}"}
-    except Exception as e:
-        return {"status": f"Error: {str(e)}"}
+class InstallRequest(BaseModel):
+    name: str
 
-# --- TERMINAL & RUNNER LOGIC ---
+@app.post("/install")
+def install_package(data: InstallRequest):
+    try:
+        # Runs 'pip install package_name' on the server
+        subprocess.check_call([sys.executable, "-m", "pip", "install", data.name])
+        return {"status": f"Successfully installed {data.name}"}
+    except Exception as e:
+        return {"status": f"Failed: {str(e)}"}
+
+# --- TERMINAL LOGIC (The Magic) ---
 
 @sio.event
 async def run_code(sid, filename):
-    global current_process, master_fd
-    
-    # 1. Kill existing process
-    if current_process:
+    # Kill previous session if exists
+    if sid in sessions:
         try:
-            os.kill(current_process.pid, signal.SIGTERM)
-        except:
+            os.kill(sessions[sid]["pid"], signal.SIGTERM)
+            os.close(sessions[sid]["fd"])
+        except: 
             pass
-    
-    # 2. Start new process with PTY (Pseudo Terminal)
-    # This allows interactive input() to work!
+        del sessions[sid]
+
+    await sio.emit('status', 'Running...', room=sid)
+
+    # Create PTY (Pseudo-Terminal) - Makes it interactive!
     master_fd, slave_fd = pty.openpty()
-    
-    current_process = subprocess.Popen(
-        [sys.executable, "-u", filename], # -u for unbuffered output
+
+    process = subprocess.Popen(
+        [sys.executable, "-u", filename], # Run Python unbuffered
         stdin=slave_fd,
         stdout=slave_fd,
         stderr=slave_fd,
         preexec_fn=os.setsid,
         close_fds=True
     )
-    
-    os.close(slave_fd) # Close slave in parent
-    
-    await sio.emit('status', 'Running...', room=sid)
 
-    # 3. Stream output loop
-    def read_output():
-        global master_fd
+    os.close(slave_fd)
+    sessions[sid] = {"fd": master_fd, "pid": process.pid}
+
+    # Background thread to read output
+    def read_output(fd, s_id):
         while True:
             try:
-                r, _, _ = select.select([master_fd], [], [], 0.1)
-                if master_fd in r:
-                    data = os.read(master_fd, 1024).decode(errors='ignore')
-                    if data:
-                        asyncio.run(sio.emit('term-data', data))
-                    else:
-                        break
-            except (OSError, ValueError):
+                # Wait for data
+                r, _, _ = select.select([fd], [], [], 0.5)
+                if fd in r:
+                    output = os.read(fd, 1024).decode(errors='ignore')
+                    if not output: break # Process finished
+                    
+                    # Send to Frontend
+                    asyncio.run(sio.emit('term-data', output, room=s_id))
+                
+                # Check if process is dead
+                if process.poll() is not None:
+                    asyncio.run(sio.emit('status', 'Stopped', room=s_id))
+                    break
+            except:
                 break
-    
-    threading.Thread(target=read_output, daemon=True).start()
+        
+        # Cleanup
+        if s_id in sessions: del sessions[s_id]
+
+    threading.Thread(target=read_output, args=(master_fd, sid), daemon=True).start()
 
 @sio.event
-async def stop_code(sid):
-    global current_process
-    if current_process:
+async def term_input(sid, data):
+    # Receive keystrokes from mobile keyboard
+    if sid in sessions:
+        fd = sessions[sid]["fd"]
         try:
-            os.kill(current_process.pid, signal.SIGTERM)
-            current_process = None
-            await sio.emit('term-data', '\n\u001b[31m[Process Stopped by User]\u001b[0m\n')
-            await sio.emit('status', 'Stopped')
+            os.write(fd, data.encode())
         except:
             pass
 
 @sio.event
-async def term_input(sid, data):
-    global master_fd
-    if master_fd:
+async def stop_code(sid):
+    if sid in sessions:
         try:
-            os.write(master_fd, data.encode())
+            os.kill(sessions[sid]["pid"], signal.SIGKILL)
+            await sio.emit('term-data', '\r\n\x1b[31m[Stopped by User]\x1b[0m\r\n', room=sid)
         except:
             pass
