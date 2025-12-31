@@ -1,0 +1,11 @@
+{
+  "name": "vercel-telegram-email-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "lint": "node -c api/telegram.js"
+  },
+  "dependencies": {}
+}
