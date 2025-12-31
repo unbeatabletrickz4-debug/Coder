@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-python-socketio
-pymongo
-python-dotenv
-dnspython
-websockets
